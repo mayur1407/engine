@@ -5,10 +5,15 @@
 // @dart = 2.6
 import 'dart:html' as html;
 
-import 'package:ui/src/engine.dart';
+import 'package:test/bootstrap/browser.dart';
 import 'package:test/test.dart';
+import 'package:ui/src/engine.dart';
 
 void main() {
+  internalBootstrapBrowserTest(() => testMain);
+}
+
+void testMain() {
   test('creating elements works', () {
     final DomRenderer renderer = DomRenderer();
     final html.Element element = renderer.createElement('div');
@@ -52,15 +57,15 @@ void main() {
   test('can set style properties on elements', () {
     final DomRenderer renderer = DomRenderer();
     final html.Element element = renderer.createElement('div');
-    renderer.setElementStyle(element, 'color', 'red');
+    DomRenderer.setElementStyle(element, 'color', 'red');
     expect(element.style.color, 'red');
   });
   test('can remove style properties from elements', () {
     final DomRenderer renderer = DomRenderer();
     final html.Element element = renderer.createElement('div');
-    renderer.setElementStyle(element, 'color', 'blue');
+    DomRenderer.setElementStyle(element, 'color', 'blue');
     expect(element.style.color, 'blue');
-    renderer.setElementStyle(element, 'color', null);
+    DomRenderer.setElementStyle(element, 'color', null);
     expect(element.style.color, '');
   });
   test('elements can have children', () {

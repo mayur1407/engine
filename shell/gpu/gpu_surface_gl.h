@@ -8,8 +8,8 @@
 #include <functional>
 #include <memory>
 
+#include "flutter/common/graphics/gl_context_switch.h"
 #include "flutter/flow/embedded_views.h"
-#include "flutter/flow/gl_context_switch.h"
 #include "flutter/flow/surface.h"
 #include "flutter/fml/macros.h"
 #include "flutter/fml/memory/weak_ptr.h"
@@ -43,15 +43,17 @@ class GPUSurfaceGL : public Surface {
   GrDirectContext* GetContext() override;
 
   // |Surface|
-  flutter::ExternalViewEmbedder* GetExternalViewEmbedder() override;
+  std::unique_ptr<GLContextResult> MakeRenderContextCurrent() override;
 
   // |Surface|
-  std::unique_ptr<GLContextResult> MakeRenderContextCurrent() override;
+  bool ClearRenderContext() override;
 
  private:
   GPUSurfaceGLDelegate* delegate_;
   sk_sp<GrDirectContext> context_;
   sk_sp<SkSurface> onscreen_surface_;
+  /// FBO backing the current `onscreen_surface_`.
+  uint32_t fbo_id_;
   bool context_owner_;
   // TODO(38466): Refactor GPU surface APIs take into account the fact that an
   // external view embedder may want to render to the root surface. This is a

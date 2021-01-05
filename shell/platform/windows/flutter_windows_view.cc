@@ -39,8 +39,7 @@ void FlutterWindowsView::SetEngine(
       std::make_unique<flutter::KeyEventHandler>(internal_plugin_messenger));
   keyboard_hook_handlers_.push_back(
       std::make_unique<flutter::TextInputPlugin>(internal_plugin_messenger));
-  platform_handler_ = std::make_unique<flutter::PlatformHandler>(
-      internal_plugin_messenger, this);
+  platform_handler_ = PlatformHandler::Create(internal_plugin_messenger, this);
   cursor_handler_ = std::make_unique<flutter::CursorHandler>(
       internal_plugin_messenger, binding_handler_.get());
 
@@ -52,6 +51,7 @@ void FlutterWindowsView::SetEngine(
 
 void FlutterWindowsView::OnWindowSizeChanged(size_t width,
                                              size_t height) const {
+  surface_manager_->ResizeSurface(GetRenderTarget(), width, height);
   SendWindowMetrics(width, height, binding_handler_->GetDpiScale());
 }
 
@@ -104,27 +104,23 @@ void FlutterWindowsView::OnScroll(double x,
   SendScroll(x, y, delta_x, delta_y, scroll_offset_multiplier);
 }
 
-void FlutterWindowsView::OnFontChange() {
-  if (engine_->engine() == nullptr) {
-    return;
-  }
-  FlutterEngineReloadSystemFonts(engine_->engine());
-}
-
 // Sends new size  information to FlutterEngine.
 void FlutterWindowsView::SendWindowMetrics(size_t width,
                                            size_t height,
                                            double dpiScale) const {
-  if (engine_->engine() == nullptr) {
-    return;
-  }
-
   FlutterWindowMetricsEvent event = {};
   event.struct_size = sizeof(event);
   event.width = width;
   event.height = height;
   event.pixel_ratio = dpiScale;
-  auto result = FlutterEngineSendWindowMetricsEvent(engine_->engine(), &event);
+  engine_->SendWindowMetricsEvent(event);
+}
+
+void FlutterWindowsView::SendInitialBounds() {
+  PhysicalWindowBounds bounds = binding_handler_->GetPhysicalWindowBounds();
+
+  SendWindowMetrics(bounds.width, bounds.height,
+                    binding_handler_->GetDpiScale());
 }
 
 // Set's |event_data|'s phase to either kMove or kHover depending on the current
@@ -236,7 +232,7 @@ void FlutterWindowsView::SendPointerEventWithData(
           std::chrono::high_resolution_clock::now().time_since_epoch())
           .count();
 
-  FlutterEngineSendPointerEvent(engine_->engine(), &event, 1);
+  engine_->SendPointerEvent(event);
 
   if (event_data.phase == FlutterPointerPhase::kAdd) {
     SetMouseFlutterStateAdded(true);
@@ -263,7 +259,9 @@ bool FlutterWindowsView::SwapBuffers() {
 }
 
 void FlutterWindowsView::CreateRenderSurface() {
-  surface_manager_->CreateSurface(render_target_.get());
+  PhysicalWindowBounds bounds = binding_handler_->GetPhysicalWindowBounds();
+  surface_manager_->CreateSurface(GetRenderTarget(), bounds.width,
+                                  bounds.height);
 }
 
 void FlutterWindowsView::DestroyRenderSurface() {
@@ -272,7 +270,7 @@ void FlutterWindowsView::DestroyRenderSurface() {
   }
 }
 
-WindowsRenderTarget* FlutterWindowsView::GetRenderTarget() {
+WindowsRenderTarget* FlutterWindowsView::GetRenderTarget() const {
   return render_target_.get();
 }
 

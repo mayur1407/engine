@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-// @dart = 2.10
+// @dart = 2.12
 part of engine;
 
 /// Text editing used by accesibility mode.
@@ -31,12 +31,44 @@ class SemanticsTextEditingStrategy extends DefaultTextEditingStrategy {
   @override
   void disable() {
     // We don't want to remove the DOM element because the caller is responsible
-    // for that.
-    //
-    // Remove focus from the editable element to cause the keyboard to hide.
+    // for that. However we still want to stop editing, cleanup the handlers.
+    assert(isEnabled);
+
+    isEnabled = false;
+    _style = null;
+    _geometry = null;
+
+    for (int i = 0; i < _subscriptions.length; i++) {
+      _subscriptions[i].cancel();
+    }
+    _subscriptions.clear();
+    _lastEditingState = null;
+
+    // If the text element still has focus, remove focus from the editable
+    // element to cause the keyboard to hide.
     // Otherwise, the keyboard stays on screen even when the user navigates to
     // a different screen (e.g. by hitting the "back" button).
-    domElement.blur();
+    if (operatingSystem == OperatingSystem.android ||
+        operatingSystem == OperatingSystem.iOs) {
+      domElement.blur();
+    }
+  }
+
+  @override
+  void addEventHandlers() {
+    if (_inputConfiguration.autofillGroup != null) {
+      _subscriptions
+          .addAll(_inputConfiguration.autofillGroup!.addInputEventListeners());
+    }
+
+    // Subscribe to text and selection changes.
+    _subscriptions.add(domElement.onInput.listen(_handleChange));
+
+    _subscriptions.add(domElement.onKeyDown.listen(_maybeSendAction));
+
+    _subscriptions.add(html.document.onSelectionChange.listen(_handleChange));
+
+    preventDefaultForMouseEvents();
   }
 
   @override
@@ -55,8 +87,6 @@ class SemanticsTextEditingStrategy extends DefaultTextEditingStrategy {
     _inputConfiguration = inputConfig;
     _onChange = onChange;
     _onAction = onAction;
-
-    domElement.focus();
   }
 
   @override
@@ -91,7 +121,7 @@ class TextField extends RoleManager {
   }
 
   SemanticsTextEditingStrategy? textEditingElement;
-  html.Element get _textFieldElement => textEditingElement!.domElement;
+  html.HtmlElement get _textFieldElement => textEditingElement!.domElement;
 
   void _setupDomElement() {
     // On iOS, even though the semantic text field is transparent, the cursor
@@ -148,8 +178,8 @@ class TextField extends RoleManager {
       }
 
       textEditing.useCustomEditableElement(textEditingElement);
-      window
-          .invokeOnSemanticsAction(semanticsObject.id, ui.SemanticsAction.tap, null);
+      EnginePlatformDispatcher.instance.invokeOnSemanticsAction(
+          semanticsObject.id, ui.SemanticsAction.tap, null);
     });
   }
 
@@ -159,6 +189,11 @@ class TextField extends RoleManager {
   /// events are present regardless of whether accessibility is enabled or not,
   /// this mode is always enabled.
   void _initializeForWebkit() {
+    // Safari for desktop is also initialized as the other browsers.
+    if (operatingSystem == OperatingSystem.macOs) {
+       _initializeForBlink();
+       return;
+    }
     num? lastTouchStartOffsetX;
     num? lastTouchStartOffsetY;
 
@@ -186,7 +221,7 @@ class TextField extends RoleManager {
 
         if (offsetX * offsetX + offsetY * offsetY < kTouchSlop) {
           // Recognize it as a tap that requires a keyboard.
-          window.invokeOnSemanticsAction(
+          EnginePlatformDispatcher.instance.invokeOnSemanticsAction(
               semanticsObject.id, ui.SemanticsAction.tap, null);
         }
       } else {

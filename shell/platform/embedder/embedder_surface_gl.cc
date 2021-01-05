@@ -11,10 +11,10 @@ namespace flutter {
 EmbedderSurfaceGL::EmbedderSurfaceGL(
     GLDispatchTable gl_dispatch_table,
     bool fbo_reset_after_present,
-    std::unique_ptr<EmbedderExternalViewEmbedder> external_view_embedder)
+    std::shared_ptr<EmbedderExternalViewEmbedder> external_view_embedder)
     : gl_dispatch_table_(gl_dispatch_table),
       fbo_reset_after_present_(fbo_reset_after_present),
-      external_view_embedder_(std::move(external_view_embedder)) {
+      external_view_embedder_(external_view_embedder) {
   // Make sure all required members of the dispatch table are checked.
   if (!gl_dispatch_table_.gl_make_current_callback ||
       !gl_dispatch_table_.gl_clear_current_callback ||
@@ -45,13 +45,13 @@ bool EmbedderSurfaceGL::GLContextClearCurrent() {
 }
 
 // |GPUSurfaceGLDelegate|
-bool EmbedderSurfaceGL::GLContextPresent() {
-  return gl_dispatch_table_.gl_present_callback();
+bool EmbedderSurfaceGL::GLContextPresent(uint32_t fbo_id) {
+  return gl_dispatch_table_.gl_present_callback(fbo_id);
 }
 
 // |GPUSurfaceGLDelegate|
-intptr_t EmbedderSurfaceGL::GLContextFBO() const {
-  return gl_dispatch_table_.gl_fbo_callback();
+intptr_t EmbedderSurfaceGL::GLContextFBO(GLFrameInfo frame_info) const {
+  return gl_dispatch_table_.gl_fbo_callback(frame_info);
 }
 
 // |GPUSurfaceGLDelegate|
@@ -68,11 +68,6 @@ SkMatrix EmbedderSurfaceGL::GLContextSurfaceTransformation() const {
     return matrix;
   }
   return callback();
-}
-
-// |GPUSurfaceGLDelegate|
-ExternalViewEmbedder* EmbedderSurfaceGL::GetExternalViewEmbedder() {
-  return external_view_embedder_.get();
 }
 
 // |GPUSurfaceGLDelegate|

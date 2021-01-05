@@ -51,6 +51,11 @@ class PluginRegistrar {
  protected:
   FlutterDesktopPluginRegistrarRef registrar() { return registrar_; }
 
+  // Destroys all owned plugins. Subclasses should call this at the beginning of
+  // their destructors to prevent the possibility of an owned plugin trying to
+  // access destroyed state during its own destruction.
+  void ClearPlugins();
+
  private:
   // Handle for interacting with the C API's registrar.
   FlutterDesktopPluginRegistrarRef registrar_;
@@ -91,8 +96,8 @@ class PluginRegistrarManager {
     auto insert_result =
         registrars_.emplace(registrar_ref, std::make_unique<T>(registrar_ref));
     auto& registrar_pair = *(insert_result.first);
-    FlutterDesktopRegistrarSetDestructionHandler(registrar_pair.first,
-                                                 OnRegistrarDestroyed);
+    FlutterDesktopPluginRegistrarSetDestructionHandler(registrar_pair.first,
+                                                       OnRegistrarDestroyed);
     return static_cast<T*>(registrar_pair.second.get());
   }
 

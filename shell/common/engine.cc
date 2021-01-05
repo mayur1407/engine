@@ -66,7 +66,8 @@ Engine::Engine(Delegate& delegate,
                std::unique_ptr<Animator> animator,
                fml::WeakPtr<IOManager> io_manager,
                fml::RefPtr<SkiaUnrefQueue> unref_queue,
-               fml::WeakPtr<SnapshotDelegate> snapshot_delegate)
+               fml::WeakPtr<SnapshotDelegate> snapshot_delegate,
+               std::shared_ptr<VolatilePathTracker> volatile_path_tracker)
     : Engine(delegate,
              dispatcher_maker,
              vm.GetConcurrentWorkerTaskRunner(),
@@ -76,11 +77,12 @@ Engine::Engine(Delegate& delegate,
              io_manager,
              nullptr) {
   runtime_controller_ = std::make_unique<RuntimeController>(
-      *this,                        // runtime delegate
-      &vm,                          // VM
-      std::move(isolate_snapshot),  // isolate snapshot
-      task_runners_,                // task runners
-      std::move(snapshot_delegate),
+      *this,                                 // runtime delegate
+      &vm,                                   // VM
+      std::move(isolate_snapshot),           // isolate snapshot
+      task_runners_,                         // task runners
+      std::move(snapshot_delegate),          // snapshot delegate
+      GetWeakPtr(),                          // hint freed delegate
       std::move(io_manager),                 // io manager
       std::move(unref_queue),                // Skia unref queue
       image_decoder_.GetWeakPtr(),           // image decoder
@@ -90,15 +92,12 @@ Engine::Engine(Delegate& delegate,
       platform_data,                         // platform data
       settings_.isolate_create_callback,     // isolate create callback
       settings_.isolate_shutdown_callback,   // isolate shutdown callback
-      settings_.persistent_isolate_data      // persistent isolate data
+      settings_.persistent_isolate_data,     // persistent isolate data
+      std::move(volatile_path_tracker)       // volatile path tracker
   );
 }
 
 Engine::~Engine() = default;
-
-float Engine::GetDisplayRefreshRate() const {
-  return animator_->GetDisplayRefreshRate();
-}
 
 fml::WeakPtr<Engine> Engine::GetWeakPtr() const {
   return weak_factory_.GetWeakPtr();
@@ -107,6 +106,10 @@ fml::WeakPtr<Engine> Engine::GetWeakPtr() const {
 void Engine::SetupDefaultFontManager() {
   TRACE_EVENT0("flutter", "Engine::SetupDefaultFontManager");
   font_collection_.SetupDefaultFontManager();
+}
+
+std::shared_ptr<AssetManager> Engine::GetAssetManager() {
+  return asset_manager_;
 }
 
 bool Engine::UpdateAssetManager(
@@ -152,90 +155,33 @@ Engine::RunStatus Engine::Run(RunConfiguration configuration) {
   last_entry_point_ = configuration.GetEntrypoint();
   last_entry_point_library_ = configuration.GetEntrypointLibrary();
 
-  auto isolate_launch_status =
-      PrepareAndLaunchIsolate(std::move(configuration));
-  if (isolate_launch_status == Engine::RunStatus::Failure) {
-    FML_LOG(ERROR) << "Engine not prepare and launch isolate.";
-    return isolate_launch_status;
-  } else if (isolate_launch_status ==
-             Engine::RunStatus::FailureAlreadyRunning) {
-    return isolate_launch_status;
+  UpdateAssetManager(configuration.GetAssetManager());
+
+  if (runtime_controller_->IsRootIsolateRunning()) {
+    return RunStatus::FailureAlreadyRunning;
   }
 
-  std::shared_ptr<DartIsolate> isolate =
-      runtime_controller_->GetRootIsolate().lock();
+  if (!runtime_controller_->LaunchRootIsolate(
+          settings_,                                 //
+          configuration.GetEntrypoint(),             //
+          configuration.GetEntrypointLibrary(),      //
+          configuration.TakeIsolateConfiguration())  //
+  ) {
+    return RunStatus::Failure;
+  }
 
-  bool isolate_running =
-      isolate && isolate->GetPhase() == DartIsolate::Phase::Running;
-
-  if (isolate_running) {
-    tonic::DartState::Scope scope(isolate.get());
-
-    if (settings_.root_isolate_create_callback) {
-      settings_.root_isolate_create_callback();
-    }
-
-    if (settings_.root_isolate_shutdown_callback) {
-      isolate->AddIsolateShutdownCallback(
-          settings_.root_isolate_shutdown_callback);
-    }
-
-    std::string service_id = isolate->GetServiceId();
+  auto service_id = runtime_controller_->GetRootIsolateServiceID();
+  if (service_id.has_value()) {
     fml::RefPtr<PlatformMessage> service_id_message =
         fml::MakeRefCounted<flutter::PlatformMessage>(
             kIsolateChannel,
-            std::vector<uint8_t>(service_id.begin(), service_id.end()),
+            std::vector<uint8_t>(service_id.value().begin(),
+                                 service_id.value().end()),
             nullptr);
     HandlePlatformMessage(service_id_message);
   }
 
-  return isolate_running ? Engine::RunStatus::Success
-                         : Engine::RunStatus::Failure;
-}
-
-Engine::RunStatus Engine::PrepareAndLaunchIsolate(
-    RunConfiguration configuration) {
-  TRACE_EVENT0("flutter", "Engine::PrepareAndLaunchIsolate");
-
-  UpdateAssetManager(configuration.GetAssetManager());
-
-  auto isolate_configuration = configuration.TakeIsolateConfiguration();
-
-  std::shared_ptr<DartIsolate> isolate =
-      runtime_controller_->GetRootIsolate().lock();
-
-  if (!isolate) {
-    return RunStatus::Failure;
-  }
-
-  // This can happen on iOS after a plugin shows a native window and returns to
-  // the Flutter ViewController.
-  if (isolate->GetPhase() == DartIsolate::Phase::Running) {
-    FML_DLOG(WARNING) << "Isolate was already running!";
-    return RunStatus::FailureAlreadyRunning;
-  }
-
-  if (!isolate_configuration->PrepareIsolate(*isolate)) {
-    FML_LOG(ERROR) << "Could not prepare to run the isolate.";
-    return RunStatus::Failure;
-  }
-
-  if (configuration.GetEntrypointLibrary().empty()) {
-    if (!isolate->Run(configuration.GetEntrypoint(),
-                      settings_.dart_entrypoint_args)) {
-      FML_LOG(ERROR) << "Could not run the isolate.";
-      return RunStatus::Failure;
-    }
-  } else {
-    if (!isolate->RunFromLibrary(configuration.GetEntrypointLibrary(),
-                                 configuration.GetEntrypoint(),
-                                 settings_.dart_entrypoint_args)) {
-      FML_LOG(ERROR) << "Could not run the isolate.";
-      return RunStatus::Failure;
-    }
-  }
-
-  return RunStatus::Success;
+  return Engine::RunStatus::Success;
 }
 
 void Engine::BeginFrame(fml::TimePoint frame_time) {
@@ -248,14 +194,19 @@ void Engine::ReportTimings(std::vector<int64_t> timings) {
   runtime_controller_->ReportTimings(std::move(timings));
 }
 
+void Engine::HintFreed(size_t size) {
+  hint_freed_bytes_since_last_idle_ += size;
+}
+
 void Engine::NotifyIdle(int64_t deadline) {
   auto trace_event = std::to_string(deadline - Dart_TimelineGetMicros());
   TRACE_EVENT1("flutter", "Engine::NotifyIdle", "deadline_now_delta",
                trace_event.c_str());
-  runtime_controller_->NotifyIdle(deadline);
+  runtime_controller_->NotifyIdle(deadline, hint_freed_bytes_since_last_idle_);
+  hint_freed_bytes_since_last_idle_ = 0;
 }
 
-std::pair<bool, uint32_t> Engine::GetUIIsolateReturnCode() {
+std::optional<uint32_t> Engine::GetUIIsolateReturnCode() {
   return runtime_controller_->GetRootIsolateReturnCode();
 }
 
@@ -495,6 +446,10 @@ void Engine::HandlePlatformMessage(fml::RefPtr<PlatformMessage> message) {
   }
 }
 
+void Engine::OnRootIsolateCreated() {
+  delegate_.OnRootIsolateCreated();
+}
+
 void Engine::UpdateIsolateDescription(const std::string isolate_name,
                                       int64_t isolate_port) {
   delegate_.UpdateIsolateDescription(isolate_name, isolate_port);
@@ -552,6 +507,34 @@ const std::string& Engine::GetLastEntrypoint() const {
 
 const std::string& Engine::GetLastEntrypointLibrary() const {
   return last_entry_point_library_;
+}
+
+// |RuntimeDelegate|
+void Engine::RequestDartDeferredLibrary(intptr_t loading_unit_id) {
+  return delegate_.RequestDartDeferredLibrary(loading_unit_id);
+}
+
+void Engine::LoadDartDeferredLibrary(
+    intptr_t loading_unit_id,
+    std::unique_ptr<const fml::Mapping> snapshot_data,
+    std::unique_ptr<const fml::Mapping> snapshot_instructions) {
+  if (runtime_controller_->IsRootIsolateRunning()) {
+    runtime_controller_->LoadDartDeferredLibrary(
+        loading_unit_id, std::move(snapshot_data),
+        std::move(snapshot_instructions));
+  } else {
+    LoadDartDeferredLibraryError(loading_unit_id, "No running root isolate.",
+                                 true);
+  }
+}
+
+void Engine::LoadDartDeferredLibraryError(intptr_t loading_unit_id,
+                                          const std::string error_message,
+                                          bool transient) {
+  if (runtime_controller_->IsRootIsolateRunning()) {
+    runtime_controller_->LoadDartDeferredLibraryError(loading_unit_id,
+                                                      error_message, transient);
+  }
 }
 
 }  // namespace flutter

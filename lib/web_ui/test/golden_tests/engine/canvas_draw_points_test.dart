@@ -6,20 +6,24 @@
 import 'dart:html' as html;
 import 'dart:typed_data';
 
+import 'package:test/bootstrap/browser.dart';
+import 'package:test/test.dart';
 import 'package:ui/src/engine.dart';
 import 'package:ui/ui.dart';
 
-import 'package:test/test.dart';
-
 import 'package:web_engine_tester/golden_tester.dart';
 
-void main() async {
+void main() {
+  internalBootstrapBrowserTest(() => testMain);
+}
+
+void testMain() async {
   final Rect region = Rect.fromLTWH(0, 0, 400, 600);
 
   BitmapCanvas canvas;
 
   setUp(() {
-    canvas = BitmapCanvas(region);
+    canvas = BitmapCanvas(region, RenderStrategy());
   });
 
   tearDown(() {

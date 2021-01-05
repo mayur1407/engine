@@ -7,12 +7,12 @@
 
 #include <memory>
 
-#include "flutter/flow/gl_context_switch.h"
-#include "flutter/flow/texture.h"
+#include "flutter/common/graphics/gl_context_switch.h"
+#include "flutter/common/graphics/texture.h"
 #include "flutter/fml/macros.h"
 #include "flutter/fml/platform/darwin/scoped_nsobject.h"
-#include "flutter/shell/platform/darwin/common/framework/Headers/FlutterTexture.h"
-#include "flutter/shell/platform/darwin/ios/rendering_api_selection.h"
+#import "flutter/shell/platform/darwin/common/framework/Headers/FlutterTexture.h"
+#import "flutter/shell/platform/darwin/ios/rendering_api_selection.h"
 #include "third_party/skia/include/gpu/GrDirectContext.h"
 
 namespace flutter {

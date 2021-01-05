@@ -18,9 +18,9 @@
 #include "flutter/shell/platform/windows/flutter_windows_engine.h"
 #include "flutter/shell/platform/windows/key_event_handler.h"
 #include "flutter/shell/platform/windows/keyboard_hook_handler.h"
+#include "flutter/shell/platform/windows/platform_handler.h"
 #include "flutter/shell/platform/windows/public/flutter_windows.h"
 #include "flutter/shell/platform/windows/text_input_plugin.h"
-#include "flutter/shell/platform/windows/win32_platform_handler.h"
 #include "flutter/shell/platform/windows/window_binding_handler.h"
 #include "flutter/shell/platform/windows/window_binding_handler_delegate.h"
 #include "flutter/shell/platform/windows/window_state.h"
@@ -52,7 +52,7 @@ class FlutterWindowsView : public WindowBindingHandlerDelegate {
   void DestroyRenderSurface();
 
   // Return the currently configured WindowsRenderTarget.
-  WindowsRenderTarget* GetRenderTarget();
+  WindowsRenderTarget* GetRenderTarget() const;
 
   // Returns the engine backing this view.
   FlutterWindowsEngine* GetEngine();
@@ -62,6 +62,9 @@ class FlutterWindowsView : public WindowBindingHandlerDelegate {
   bool MakeCurrent();
   bool MakeResourceCurrent();
   bool SwapBuffers();
+
+  // Send initial bounds to embedder.  Must occur after engine has initialized.
+  void SendInitialBounds();
 
   // |WindowBindingHandlerDelegate|
   void OnWindowSizeChanged(size_t width, size_t height) const override;
@@ -94,9 +97,6 @@ class FlutterWindowsView : public WindowBindingHandlerDelegate {
                 double delta_x,
                 double delta_y,
                 int scroll_offset_multiplier) override;
-
-  // |WindowBindingHandlerDelegate|
-  void OnFontChange() override;
 
  private:
   // Struct holding the mouse state. The engine doesn't keep track of which

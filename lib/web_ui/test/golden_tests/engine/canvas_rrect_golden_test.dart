@@ -5,13 +5,18 @@
 // @dart = 2.6
 import 'dart:html' as html;
 
+import 'package:test/bootstrap/browser.dart';
+import 'package:test/test.dart';
 import 'package:ui/src/engine.dart';
 import 'package:ui/ui.dart';
-import 'package:test/test.dart';
 
 import 'package:web_engine_tester/golden_tester.dart';
 
-void main() async {
+void main() {
+  internalBootstrapBrowserTest(() => testMain);
+}
+
+void testMain() async {
   final Rect region = Rect.fromLTWH(8, 8, 500, 100); // Compensate for old scuba tester padding
 
   BitmapCanvas canvas;
@@ -26,7 +31,8 @@ void main() async {
   const Radius someFixedRadius = Radius.circular(10);
 
   setUp(() {
-    canvas = BitmapCanvas(const Rect.fromLTWH(0, 0, 500, 100));
+    canvas = BitmapCanvas(const Rect.fromLTWH(0, 0, 500, 100),
+        RenderStrategy());
     canvas.translate(10, 10); // Center
   });
 

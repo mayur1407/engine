@@ -4,8 +4,9 @@
 
 #define FML_USED_ON_EMBEDDER
 
-#include "flutter/shell/platform/darwin/ios/framework/Source/FlutterDartProject_Internal.h"
+#import "flutter/shell/platform/darwin/ios/framework/Source/FlutterDartProject_Internal.h"
 
+#include "flutter/common/constants.h"
 #include "flutter/common/task_runners.h"
 #include "flutter/fml/mapping.h"
 #include "flutter/fml/message_loop.h"
@@ -13,8 +14,8 @@
 #include "flutter/runtime/dart_vm.h"
 #include "flutter/shell/common/shell.h"
 #include "flutter/shell/common/switches.h"
-#include "flutter/shell/platform/darwin/common/command_line.h"
-#include "flutter/shell/platform/darwin/ios/framework/Headers/FlutterViewController.h"
+#import "flutter/shell/platform/darwin/common/command_line.h"
+#import "flutter/shell/platform/darwin/ios/framework/Headers/FlutterViewController.h"
 
 extern "C" {
 #if FLUTTER_RUNTIME_MODE == FLUTTER_RUNTIME_MODE_DEBUG
@@ -26,43 +27,7 @@ extern const intptr_t kPlatformStrongDillSize;
 
 static const char* kApplicationKernelSnapshotFileName = "kernel_blob.bin";
 
-// TODO(mehmetf): Announce this since it is breaking change then enable it.
-// static NSString* DomainNetworkPolicy(NSDictionary* appTransportSecurity) {
-//   if (appTransportSecurity == nil) {
-//     return @"";
-//   }
-//   //
-//   https://developer.apple.com/documentation/bundleresources/information_property_list/nsapptransportsecurity/nsexceptiondomains
-//   NSDictionary* exceptionDomains = [appTransportSecurity objectForKey:@"NSExceptionDomains"];
-//   if (exceptionDomains == nil) {
-//     return @"";
-//   }
-//   NSMutableArray* networkConfigArray = [[NSMutableArray alloc] init];
-//   for (NSString* domain in exceptionDomains) {
-//     NSDictionary* domainConfiguration = [exceptionDomains objectForKey:domain];
-//     BOOL includesSubDomains =
-//         [[domainConfiguration objectForKey:@"NSIncludesSubdomains"] boolValue];
-//     BOOL allowsCleartextCommunication =
-//         [[domainConfiguration objectForKey:@"NSExceptionAllowsInsecureHTTPLoads"] boolValue];
-//     [networkConfigArray addObject:[NSArray arrayWithObjects:domain, includesSubDomains,
-//                                                             allowsCleartextCommunication, nil]];
-//   }
-//   NSData* jsonData = [NSJSONSerialization dataWithJSONObject:networkConfigArray
-//                                                      options:0
-//                                                        error:NULL];
-//   return [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding];
-// }
-
-// TODO(mehmetf): Announce this since it is breaking change then enable it.
-// static bool AllowsArbitraryLoads(NSDictionary* appTransportSecurity) {
-//   if (appTransportSecurity != nil) {
-//     return [[appTransportSecurity objectForKey:@"NSAllowsArbitraryLoads"] boolValue];
-//   } else {
-//     return false;
-//   }
-// }
-
-static flutter::Settings DefaultSettingsForProcess(NSBundle* bundle = nil) {
+flutter::Settings FLTDefaultSettingsForBundle(NSBundle* bundle) {
   auto command_line = flutter::CommandLineFromNSProcessInfo();
 
   // Precedence:
@@ -168,12 +133,13 @@ static flutter::Settings DefaultSettingsForProcess(NSBundle* bundle = nil) {
     }
   }
 
-  // TODO(mehmetf): Announce this since it is breaking change then enable it.
   // Domain network configuration
-  // NSDictionary* appTransportSecurity =
-  //     [mainBundle objectForInfoDictionaryKey:@"NSAppTransportSecurity"];
-  // settings.may_insecurely_connect_to_all_domains = AllowsArbitraryLoads(appTransportSecurity);
-  // settings.domain_network_policy = DomainNetworkPolicy(appTransportSecurity).UTF8String;
+  NSDictionary* appTransportSecurity =
+      [mainBundle objectForInfoDictionaryKey:@"NSAppTransportSecurity"];
+  settings.may_insecurely_connect_to_all_domains =
+      [FlutterDartProject allowsArbitraryLoads:appTransportSecurity];
+  settings.domain_network_policy =
+      [FlutterDartProject domainNetworkPolicy:appTransportSecurity].UTF8String;
 
 #if FLUTTER_RUNTIME_MODE == FLUTTER_RUNTIME_MODE_DEBUG
   // There are no ownership concerns here as all mappings are owned by the
@@ -186,6 +152,16 @@ static flutter::Settings DefaultSettingsForProcess(NSBundle* bundle = nil) {
       make_mapping_callback(kPlatformStrongDill, kPlatformStrongDillSize);
 #endif  // FLUTTER_RUNTIME_MODE == FLUTTER_RUNTIME_MODE_DEBUG
 
+  // If we even support setting this e.g. from the command line or the plist,
+  // we should let the user override it.
+  // Otherwise, we want to set this to a value that will avoid having the OS
+  // kill us. On most iOS devices, that happens somewhere near half
+  // the available memory.
+  // The VM expects this value to be in megabytes.
+  if (settings.old_gen_heap_size <= 0) {
+    settings.old_gen_heap_size = std::round([NSProcessInfo processInfo].physicalMemory * .48 /
+                                            flutter::kMegaByteSizeInBytes);
+  }
   return settings;
 }
 
@@ -205,7 +181,17 @@ static flutter::Settings DefaultSettingsForProcess(NSBundle* bundle = nil) {
   self = [super init];
 
   if (self) {
-    _settings = DefaultSettingsForProcess(bundle);
+    _settings = FLTDefaultSettingsForBundle(bundle);
+  }
+
+  return self;
+}
+
+- (instancetype)initWithSettings:(const flutter::Settings&)settings {
+  self = [self initWithPrecompiledDartBundle:nil];
+
+  if (self) {
+    _settings = settings;
   }
 
   return self;
@@ -260,6 +246,34 @@ static flutter::Settings DefaultSettingsForProcess(NSBundle* bundle = nil) {
     flutterAssetsName = @"Frameworks/App.framework/flutter_assets";
   }
   return flutterAssetsName;
+}
+
++ (NSString*)domainNetworkPolicy:(NSDictionary*)appTransportSecurity {
+  // https://developer.apple.com/documentation/bundleresources/information_property_list/nsapptransportsecurity/nsexceptiondomains
+  NSDictionary* exceptionDomains = [appTransportSecurity objectForKey:@"NSExceptionDomains"];
+  if (exceptionDomains == nil) {
+    return @"";
+  }
+  NSMutableArray* networkConfigArray = [[NSMutableArray alloc] init];
+  for (NSString* domain in exceptionDomains) {
+    NSDictionary* domainConfiguration = [exceptionDomains objectForKey:domain];
+    // Default value is false.
+    bool includesSubDomains =
+        [[domainConfiguration objectForKey:@"NSIncludesSubdomains"] boolValue];
+    bool allowsCleartextCommunication =
+        [[domainConfiguration objectForKey:@"NSExceptionAllowsInsecureHTTPLoads"] boolValue];
+    [networkConfigArray addObject:@[
+      domain, includesSubDomains ? @YES : @NO, allowsCleartextCommunication ? @YES : @NO
+    ]];
+  }
+  NSData* jsonData = [NSJSONSerialization dataWithJSONObject:networkConfigArray
+                                                     options:0
+                                                       error:NULL];
+  return [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding];
+}
+
++ (bool)allowsArbitraryLoads:(NSDictionary*)appTransportSecurity {
+  return [[appTransportSecurity objectForKey:@"NSAllowsArbitraryLoads"] boolValue];
 }
 
 + (NSString*)lookupKeyForAsset:(NSString*)asset {

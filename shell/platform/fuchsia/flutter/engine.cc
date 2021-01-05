@@ -7,6 +7,7 @@
 #include <lib/async/cpp/task.h>
 #include <zircon/status.h>
 
+#include "flutter/common/graphics/persistent_cache.h"
 #include "flutter/common/task_runners.h"
 #include "flutter/fml/make_copyable.h"
 #include "flutter/fml/synchronization/waitable_event.h"
@@ -14,15 +15,20 @@
 #include "flutter/runtime/dart_vm_lifecycle.h"
 #include "flutter/shell/common/rasterizer.h"
 #include "flutter/shell/common/run_configuration.h"
+#include "flutter/shell/common/serialization_callbacks.h"
+#include "third_party/skia/include/core/SkPicture.h"
+#include "third_party/skia/include/core/SkSerialProcs.h"
 #include "third_party/skia/include/ports/SkFontMgr_fuchsia.h"
 
 #include "../runtime/dart/utils/files.h"
-#include "compositor_context.h"
-#include "flutter_runner_product_configuration.h"
 #include "fuchsia_intl.h"
 #include "platform_view.h"
+#include "surface.h"
 #include "task_runner_adapter.h"
-#include "thread.h"
+
+#if defined(LEGACY_FUCHSIA_EMBEDDER)
+#include "compositor_context.h"  // nogncheck
+#endif
 
 namespace flutter_runner {
 namespace {
@@ -58,7 +64,6 @@ Engine::Engine(Delegate& delegate,
                std::shared_ptr<sys::ServiceDirectory> svc,
                std::shared_ptr<sys::ServiceDirectory> runner_services,
                flutter::Settings settings,
-               fml::RefPtr<const flutter::DartSnapshot> isolate_snapshot,
                fuchsia::ui::views::ViewToken view_token,
                scenic::ViewRefPair view_ref_pair,
                UniqueFDIONS fdio_ns,
@@ -66,6 +71,10 @@ Engine::Engine(Delegate& delegate,
                FlutterRunnerProductConfiguration product_config)
     : delegate_(delegate),
       thread_label_(std::move(thread_label)),
+#if defined(LEGACY_FUCHSIA_EMBEDDER)
+      use_legacy_renderer_(product_config.use_legacy_renderer()),
+#endif
+      intercept_all_input_(product_config.get_intercept_all_input()),
       weak_factory_(this) {
   if (zx::event::create(0, &vsync_event_) != ZX_OK) {
     FML_DLOG(ERROR) << "Could not create the vsync event.";
@@ -114,21 +123,40 @@ Engine::Engine(Delegate& delegate,
   };
 
   // Set up the session connection and other Scenic helpers on the raster
-  // thread.
+  // thread. We also need to wait for the external view embedder to be setup
+  // before creating the shell.
+  fml::AutoResetWaitableEvent view_embedder_latch;
   task_runners.GetRasterTaskRunner()->PostTask(fml::MakeCopyable(
       [this, session = std::move(session),
        session_error_callback = std::move(session_error_callback),
        view_token = std::move(view_token),
        view_ref_pair = std::move(view_ref_pair),
-       vsync_handle = vsync_event_.get()]() mutable {
+       max_frames_in_flight = product_config.get_max_frames_in_flight(),
+       vsync_handle = vsync_event_.get(), &view_embedder_latch]() mutable {
         session_connection_.emplace(
             thread_label_, std::move(session),
-            std::move(session_error_callback), [](auto) {}, vsync_handle);
+            std::move(session_error_callback), [](auto) {}, vsync_handle,
+            max_frames_in_flight);
         surface_producer_.emplace(session_connection_->get());
-        scene_update_context_.emplace(thread_label_, std::move(view_token),
-                                      std::move(view_ref_pair),
-                                      session_connection_.value());
+#if defined(LEGACY_FUCHSIA_EMBEDDER)
+        if (use_legacy_renderer_) {
+          legacy_external_view_embedder_ =
+              std::make_shared<flutter::SceneUpdateContext>(
+                  thread_label_, std::move(view_token),
+                  std::move(view_ref_pair), session_connection_.value(),
+                  intercept_all_input_);
+        } else
+#endif
+        {
+          external_view_embedder_ =
+              std::make_shared<FuchsiaExternalViewEmbedder>(
+                  thread_label_, std::move(view_token),
+                  std::move(view_ref_pair), session_connection_.value(),
+                  surface_producer_.value(), intercept_all_input_);
+        }
+        view_embedder_latch.Signal();
       }));
+  view_embedder_latch.Wait();
 
   // Grab the parent environment services. The platform view may want to
   // access some of these services.
@@ -146,14 +174,15 @@ Engine::Engine(Delegate& delegate,
       std::bind(&Engine::CreateView, this, std::placeholders::_1,
                 std::placeholders::_2, std::placeholders::_3);
 
+  OnUpdateView on_update_view_callback =
+      std::bind(&Engine::UpdateView, this, std::placeholders::_1,
+                std::placeholders::_2, std::placeholders::_3);
+
   OnDestroyView on_destroy_view_callback =
       std::bind(&Engine::DestroyView, this, std::placeholders::_1);
 
-  OnGetViewEmbedder on_get_view_embedder_callback =
-      std::bind(&Engine::GetViewEmbedder, this);
-
-  OnGetGrContext on_get_gr_context_callback =
-      std::bind(&Engine::GetGrContext, this);
+  OnCreateSurface on_create_surface_callback =
+      std::bind(&Engine::CreateSurface, this);
 
   // SessionListener has a OnScenicError method; invoke this callback on the
   // platform thread when that happens. The Session itself should also be
@@ -167,6 +196,12 @@ Engine::Engine(Delegate& delegate,
           }
         });
       };
+
+  // Launch the engine in the appropriate configuration.
+  // Note: this initializes the Asset Manager on the global PersistantCache
+  // so it must be called before WarmupSkps() is called below.
+  auto run_configuration = flutter::RunConfiguration::InferFromSettings(
+      settings, task_runners.GetIOTaskRunner());
 
   // Setup the callback that will instantiate the platform view.
   flutter::Shell::CreateCallback<flutter::PlatformView>
@@ -182,12 +217,12 @@ Engine::Engine(Delegate& delegate,
            on_enable_wireframe_callback =
                std::move(on_enable_wireframe_callback),
            on_create_view_callback = std::move(on_create_view_callback),
+           on_update_view_callback = std::move(on_update_view_callback),
            on_destroy_view_callback = std::move(on_destroy_view_callback),
-           on_get_view_embedder_callback =
-               std::move(on_get_view_embedder_callback),
-           on_get_gr_context_callback = std::move(on_get_gr_context_callback),
-           vsync_handle = vsync_event_.get(),
-           product_config = product_config](flutter::Shell& shell) mutable {
+           on_create_surface_callback = std::move(on_create_surface_callback),
+           external_view_embedder = GetExternalViewEmbedder(),
+           vsync_offset = product_config.get_vsync_offset(),
+           vsync_handle = vsync_event_.get()](flutter::Shell& shell) mutable {
             return std::make_unique<flutter_runner::PlatformView>(
                 shell,                   // delegate
                 debug_label,             // debug label
@@ -200,28 +235,64 @@ Engine::Engine(Delegate& delegate,
                 std::move(on_session_listener_error_callback),
                 std::move(on_enable_wireframe_callback),
                 std::move(on_create_view_callback),
+                std::move(on_update_view_callback),
                 std::move(on_destroy_view_callback),
-                std::move(on_get_view_embedder_callback),
-                std::move(on_get_gr_context_callback),
-                vsync_handle,  // vsync handle
-                product_config);
+                std::move(on_create_surface_callback),
+                external_view_embedder,   // external view embedder
+                std::move(vsync_offset),  // vsync offset
+                vsync_handle);
           });
 
   // Setup the callback that will instantiate the rasterizer.
-  flutter::Shell::CreateCallback<flutter::Rasterizer> on_create_rasterizer =
-      fml::MakeCopyable([this](flutter::Shell& shell) mutable {
-        FML_DCHECK(session_connection_);
+  flutter::Shell::CreateCallback<flutter::Rasterizer> on_create_rasterizer;
+#if defined(LEGACY_FUCHSIA_EMBEDDER)
+  on_create_rasterizer = [this, &product_config](flutter::Shell& shell) {
+    if (use_legacy_renderer_) {
+      FML_DCHECK(session_connection_);
+      FML_DCHECK(surface_producer_);
+      FML_DCHECK(legacy_external_view_embedder_);
+
+      if (product_config.enable_shader_warmup()) {
         FML_DCHECK(surface_producer_);
-        FML_DCHECK(scene_update_context_);
+        WarmupSkps(shell.GetDartVM()
+                       ->GetConcurrentMessageLoop()
+                       ->GetTaskRunner()
+                       .get(),
+                   shell.GetTaskRunners().GetRasterTaskRunner().get(),
+                   surface_producer_.value());
+      }
 
-        std::unique_ptr<flutter_runner::CompositorContext> compositor_context =
-            std::make_unique<flutter_runner::CompositorContext>(
-                session_connection_.value(), surface_producer_.value(),
-                scene_update_context_.value());
-
-        return std::make_unique<flutter::Rasterizer>(
-            shell, std::move(compositor_context));
-      });
+      auto compositor_context =
+          std::make_unique<flutter_runner::CompositorContext>(
+              session_connection_.value(), surface_producer_.value(),
+              legacy_external_view_embedder_);
+      return std::make_unique<flutter::Rasterizer>(
+          shell, std::move(compositor_context));
+    } else {
+      if (product_config.enable_shader_warmup()) {
+        FML_DCHECK(surface_producer_);
+        WarmupSkps(shell.GetDartVM()
+                       ->GetConcurrentMessageLoop()
+                       ->GetTaskRunner()
+                       .get(),
+                   shell.GetTaskRunners().GetRasterTaskRunner().get(),
+                   surface_producer_.value());
+      }
+      return std::make_unique<flutter::Rasterizer>(shell);
+    }
+  };
+#else
+  on_create_rasterizer = [this, &product_config](flutter::Shell& shell) {
+    if (product_config.enable_shader_warmup()) {
+      FML_DCHECK(surface_producer_);
+      WarmupSkps(
+          shell.GetDartVM()->GetConcurrentMessageLoop()->GetTaskRunner().get(),
+          shell.GetTaskRunners().GetRasterTaskRunner().get(),
+          surface_producer_.value());
+    }
+    return std::make_unique<flutter::Rasterizer>(shell);
+  };
+#endif
 
   settings.root_isolate_create_callback =
       std::bind(&Engine::OnMainIsolateStart, this);
@@ -235,22 +306,14 @@ Engine::Engine(Delegate& delegate,
         });
       });
 
-  auto vm = flutter::DartVMRef::Create(settings);
-
-  if (!isolate_snapshot) {
-    isolate_snapshot = vm->GetVMData()->GetIsolateSnapshot();
-  }
-
   {
     TRACE_EVENT0("flutter", "CreateShell");
     shell_ = flutter::Shell::Create(
         std::move(task_runners),             // host task runners
         flutter::PlatformData(),             // default window data
         std::move(settings),                 // shell launch settings
-        std::move(isolate_snapshot),         // isolate snapshot
         std::move(on_create_platform_view),  // platform view create callback
-        std::move(on_create_rasterizer),     // rasterizer create callback
-        std::move(vm)                        // vm reference
+        std::move(on_create_rasterizer)      // rasterizer create callback
     );
   }
 
@@ -325,10 +388,6 @@ Engine::Engine(Delegate& delegate,
     };
   }
 
-  // Launch the engine in the appropriate configuration.
-  auto run_configuration = flutter::RunConfiguration::InferFromSettings(
-      shell_->GetSettings(), shell_->GetTaskRunners().GetIOTaskRunner());
-
   auto on_run_failure = [weak = weak_factory_.GetWeakPtr()]() {
     // The engine could have been killed by the caller right after the
     // constructor was called but before it could run on the UI thread.
@@ -372,11 +431,11 @@ Engine::~Engine() {
   }
 }
 
-std::pair<bool, uint32_t> Engine::GetEngineReturnCode() const {
-  std::pair<bool, uint32_t> code(false, 0);
+std::optional<uint32_t> Engine::GetEngineReturnCode() const {
   if (!shell_) {
-    return code;
+    return std::nullopt;
   }
+  std::optional<uint32_t> code;
   fml::AutoResetWaitableEvent latch;
   fml::TaskRunner::RunNowOrPostTask(
       shell_->GetTaskRunners().GetUITaskRunner(),
@@ -474,48 +533,103 @@ void Engine::Terminate() {
 }
 
 void Engine::DebugWireframeSettingsChanged(bool enabled) {
-  if (!shell_ || !scene_update_context_) {
-    return;
-  }
+  FML_CHECK(shell_);
 
-  shell_->GetTaskRunners().GetRasterTaskRunner()->PostTask(
-      [this, enabled]() { scene_update_context_->EnableWireframe(enabled); });
+  shell_->GetTaskRunners().GetRasterTaskRunner()->PostTask([this, enabled]() {
+#if defined(LEGACY_FUCHSIA_EMBEDDER)
+    if (use_legacy_renderer_) {
+      FML_CHECK(legacy_external_view_embedder_);
+      legacy_external_view_embedder_->EnableWireframe(enabled);
+    } else
+#endif
+    {
+      FML_CHECK(external_view_embedder_);
+      external_view_embedder_->EnableWireframe(enabled);
+    }
+  });
 }
 
 void Engine::CreateView(int64_t view_id, bool hit_testable, bool focusable) {
-  if (!shell_ || !scene_update_context_) {
-    return;
-  }
+  FML_CHECK(shell_);
 
   shell_->GetTaskRunners().GetRasterTaskRunner()->PostTask(
       [this, view_id, hit_testable, focusable]() {
-        scene_update_context_->CreateView(view_id, hit_testable, focusable);
+#if defined(LEGACY_FUCHSIA_EMBEDDER)
+        if (use_legacy_renderer_) {
+          FML_CHECK(legacy_external_view_embedder_);
+          legacy_external_view_embedder_->CreateView(view_id, hit_testable,
+                                                     focusable);
+        } else
+#endif
+        {
+          FML_CHECK(external_view_embedder_);
+          external_view_embedder_->CreateView(view_id);
+          external_view_embedder_->SetViewProperties(view_id, hit_testable,
+                                                     focusable);
+        }
+      });
+}
+
+void Engine::UpdateView(int64_t view_id, bool hit_testable, bool focusable) {
+  FML_CHECK(shell_);
+
+  shell_->GetTaskRunners().GetRasterTaskRunner()->PostTask(
+      [this, view_id, hit_testable, focusable]() {
+#if defined(LEGACY_FUCHSIA_EMBEDDER)
+        if (use_legacy_renderer_) {
+          FML_CHECK(legacy_external_view_embedder_);
+          legacy_external_view_embedder_->UpdateView(view_id, hit_testable,
+                                                     focusable);
+        } else
+#endif
+        {
+          FML_CHECK(external_view_embedder_);
+          external_view_embedder_->SetViewProperties(view_id, hit_testable,
+                                                     focusable);
+        }
       });
 }
 
 void Engine::DestroyView(int64_t view_id) {
-  if (!shell_ || !scene_update_context_) {
-    return;
-  }
+  FML_CHECK(shell_);
 
-  shell_->GetTaskRunners().GetRasterTaskRunner()->PostTask(
-      [this, view_id]() { scene_update_context_->DestroyView(view_id); });
+  shell_->GetTaskRunners().GetRasterTaskRunner()->PostTask([this, view_id]() {
+#if defined(LEGACY_FUCHSIA_EMBEDDER)
+    if (use_legacy_renderer_) {
+      FML_CHECK(legacy_external_view_embedder_);
+      legacy_external_view_embedder_->DestroyView(view_id);
+    } else
+#endif
+    {
+      FML_CHECK(external_view_embedder_);
+      external_view_embedder_->DestroyView(view_id);
+    }
+  });
 }
 
-flutter::ExternalViewEmbedder* Engine::GetViewEmbedder() {
-  if (!scene_update_context_) {
-    return nullptr;
-  }
-
-  return &scene_update_context_.value();
+std::unique_ptr<flutter::Surface> Engine::CreateSurface() {
+  return std::make_unique<Surface>(thread_label_, GetExternalViewEmbedder(),
+                                   surface_producer_->gr_context());
 }
 
-GrDirectContext* Engine::GetGrContext() {
-  // GetGrContext should be called only after rasterizer is created.
-  FML_DCHECK(shell_);
-  FML_DCHECK(shell_->GetRasterizer());
+std::shared_ptr<flutter::ExternalViewEmbedder>
+Engine::GetExternalViewEmbedder() {
+  std::shared_ptr<flutter::ExternalViewEmbedder> external_view_embedder =
+      nullptr;
 
-  return surface_producer_->gr_context();
+#if defined(LEGACY_FUCHSIA_EMBEDDER)
+  if (use_legacy_renderer_) {
+    FML_CHECK(legacy_external_view_embedder_);
+    external_view_embedder = legacy_external_view_embedder_;
+  } else
+#endif
+  {
+    FML_CHECK(external_view_embedder_);
+    external_view_embedder = external_view_embedder_;
+  }
+  FML_CHECK(external_view_embedder);
+
+  return external_view_embedder;
 }
 
 #if !defined(DART_PRODUCT)
@@ -529,5 +643,80 @@ void Engine::WriteProfileToTrace() const {
   }
 }
 #endif  // !defined(DART_PRODUCT)
+
+void Engine::WarmupSkps(fml::BasicTaskRunner* concurrent_task_runner,
+                        fml::BasicTaskRunner* raster_task_runner,
+                        VulkanSurfaceProducer& surface_producer) {
+  SkISize size = SkISize::Make(1024, 600);
+  // We use a raw pointer here because we want to keep this alive until all gpu
+  // work is done and the callbacks skia takes for this are function pointers
+  // so we are unable to use a lambda that captures the smart pointer.
+  SurfaceProducerSurface* skp_warmup_surface =
+      surface_producer.ProduceOffscreenSurface(size).release();
+  if (!skp_warmup_surface) {
+    FML_LOG(ERROR) << "Failed to create offscreen warmup surface";
+    return;
+  }
+
+  // tell concurrent task runner to deserialize all skps available from
+  // the asset manager
+  concurrent_task_runner->PostTask([raster_task_runner, skp_warmup_surface,
+                                    &surface_producer]() {
+    TRACE_DURATION("flutter", "DeserializeSkps");
+    std::vector<std::unique_ptr<fml::Mapping>> skp_mappings =
+        flutter::PersistentCache::GetCacheForProcess()
+            ->GetSkpsFromAssetManager();
+
+    size_t total_size = 0;
+    for (auto& mapping : skp_mappings) {
+      total_size += mapping->GetSize();
+    }
+
+    FML_LOG(INFO) << "Shader warmup got " << skp_mappings.size()
+                  << " skp's with a total size of " << total_size << " bytes";
+
+    std::vector<sk_sp<SkPicture>> pictures;
+    unsigned int i = 0;
+    for (auto& mapping : skp_mappings) {
+      std::unique_ptr<SkMemoryStream> stream =
+          SkMemoryStream::MakeDirect(mapping->GetMapping(), mapping->GetSize());
+      SkDeserialProcs procs = {0};
+      procs.fImageProc = flutter::DeserializeImageWithoutData;
+      procs.fTypefaceProc = flutter::DeserializeTypefaceWithoutData;
+      sk_sp<SkPicture> picture =
+          SkPicture::MakeFromStream(stream.get(), &procs);
+      if (!picture) {
+        FML_LOG(ERROR) << "Failed to deserialize picture " << i;
+        continue;
+      }
+
+      // Tell raster task runner to warmup have the compositor
+      // context warm up the newly deserialized picture
+      raster_task_runner->PostTask([skp_warmup_surface, picture,
+                                    &surface_producer, i,
+                                    count = skp_mappings.size()] {
+        TRACE_DURATION("flutter", "WarmupSkp");
+        skp_warmup_surface->GetSkiaSurface()->getCanvas()->drawPicture(picture);
+
+        if (i < count - 1) {
+          // For all but the last skp we fire and forget
+          surface_producer.gr_context()->flushAndSubmit();
+        } else {
+          // For the last skp we provide a callback that frees the warmup
+          // surface
+          struct GrFlushInfo flush_info;
+          flush_info.fFinishedContext = skp_warmup_surface;
+          flush_info.fFinishedProc = [](void* skp_warmup_surface) {
+            delete static_cast<SurfaceProducerSurface*>(skp_warmup_surface);
+          };
+
+          surface_producer.gr_context()->flush(flush_info);
+          surface_producer.gr_context()->submit();
+        }
+      });
+      i++;
+    }
+  });
+}
 
 }  // namespace flutter_runner

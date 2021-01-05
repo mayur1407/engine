@@ -4,17 +4,20 @@
 
 package io.flutter.embedding.engine.loader;
 
+import android.app.ActivityManager;
 import android.content.Context;
+import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
 import android.content.res.AssetManager;
+import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
-import android.util.Log;
 import android.view.WindowManager;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import io.flutter.BuildConfig;
+import io.flutter.Log;
 import io.flutter.embedding.engine.FlutterJNI;
 import io.flutter.util.PathUtils;
 import io.flutter.view.VsyncWaiter;
@@ -27,6 +30,9 @@ import java.util.concurrent.Future;
 /** Finds Flutter resources in an application APK and also loads Flutter's native library. */
 public class FlutterLoader {
   private static final String TAG = "FlutterLoader";
+
+  private static final String OLD_GEN_HEAP_SIZE_META_DATA_KEY =
+      "io.flutter.embedding.android.OldGenHeapSize";
 
   // Must match values in flutter::switches
   static final String AOT_SHARED_LIBRARY_NAME = "aot-shared-library-name";
@@ -47,7 +53,10 @@ public class FlutterLoader {
    * <p>The returned instance loads Flutter native libraries in the standard way. A singleton object
    * is used instead of static methods to facilitate testing without actually running native library
    * linking.
+   *
+   * @deprecated Use the {@link io.flutter.FlutterInjector} instead.
    */
+  @Deprecated
   @NonNull
   public static FlutterLoader getInstance() {
     if (instance == null) {
@@ -56,17 +65,26 @@ public class FlutterLoader {
     return instance;
   }
 
-  @NonNull
-  public static FlutterLoader getInstanceForTest(FlutterApplicationInfo flutterApplicationInfo) {
-    FlutterLoader loader = new FlutterLoader();
-    loader.flutterApplicationInfo = flutterApplicationInfo;
-    return loader;
+  /** Creates a {@code FlutterLoader} that uses a default constructed {@link FlutterJNI}. */
+  public FlutterLoader() {
+    this(new FlutterJNI());
+  }
+
+  /**
+   * Creates a {@code FlutterLoader} with the specified {@link FlutterJNI}.
+   *
+   * @param flutterJNI The {@link FlutterJNI} instance to use for loading the libflutter.so C++
+   *     library, setting up the font manager, and calling into C++ initalization.
+   */
+  public FlutterLoader(@NonNull FlutterJNI flutterJNI) {
+    this.flutterJNI = flutterJNI;
   }
 
   private boolean initialized = false;
   @Nullable private Settings settings;
   private long initStartTimestampMillis;
   private FlutterApplicationInfo flutterApplicationInfo;
+  private FlutterJNI flutterJNI;
 
   private static class InitResult {
     final String appStoragePath;
@@ -128,7 +146,7 @@ public class FlutterLoader {
           public InitResult call() {
             ResourceExtractor resourceExtractor = initResources(appContext);
 
-            System.loadLibrary("flutter");
+            flutterJNI.loadLibrary();
 
             // Prefetch the default font manager as soon as possible on a background thread.
             // It helps to reduce time cost of engine setup that blocks the platform thread.
@@ -137,7 +155,7 @@ public class FlutterLoader {
                     new Runnable() {
                       @Override
                       public void run() {
-                        FlutterJNI.nativePrefetchDefaultFontManager();
+                        flutterJNI.prefetchDefaultFontManager();
                       }
                     });
 
@@ -216,23 +234,38 @@ public class FlutterLoader {
       }
 
       shellArgs.add("--cache-dir-path=" + result.engineCachesPath);
-      // TODO(mehmetf): Announce this since it is a breaking change then enable it.
-      // if (!flutterApplicationInfo.clearTextPermitted) {
-      //   shellArgs.add("--disallow-insecure-connections");
-      // }
+      if (!flutterApplicationInfo.clearTextPermitted) {
+        shellArgs.add("--disallow-insecure-connections");
+      }
       if (flutterApplicationInfo.domainNetworkPolicy != null) {
         shellArgs.add("--domain-network-policy=" + flutterApplicationInfo.domainNetworkPolicy);
-      }
-      if (flutterApplicationInfo.useEmbeddedView) {
-        shellArgs.add("--use-embedded-view");
       }
       if (settings.getLogTag() != null) {
         shellArgs.add("--log-tag=" + settings.getLogTag());
       }
 
+      ApplicationInfo applicationInfo =
+          applicationContext
+              .getPackageManager()
+              .getApplicationInfo(
+                  applicationContext.getPackageName(), PackageManager.GET_META_DATA);
+      Bundle metaData = applicationInfo.metaData;
+      int oldGenHeapSizeMegaBytes =
+          metaData != null ? metaData.getInt(OLD_GEN_HEAP_SIZE_META_DATA_KEY) : 0;
+      if (oldGenHeapSizeMegaBytes == 0) {
+        // default to half of total memory.
+        ActivityManager activityManager =
+            (ActivityManager) applicationContext.getSystemService(Context.ACTIVITY_SERVICE);
+        ActivityManager.MemoryInfo memInfo = new ActivityManager.MemoryInfo();
+        activityManager.getMemoryInfo(memInfo);
+        oldGenHeapSizeMegaBytes = (int) (memInfo.totalMem / 1e6 / 2);
+      }
+
+      shellArgs.add("--old-gen-heap-size=" + oldGenHeapSizeMegaBytes);
+
       long initTimeMillis = SystemClock.uptimeMillis() - initStartTimestampMillis;
 
-      FlutterJNI.nativeInit(
+      flutterJNI.init(
           applicationContext,
           shellArgs.toArray(new String[0]),
           kernelPath,
@@ -292,6 +325,11 @@ public class FlutterLoader {
                         });
               }
             });
+  }
+
+  /** Returns whether the FlutterLoader has finished loading the native library. */
+  public boolean initialized() {
+    return initialized;
   }
 
   /** Extract assets out of the APK that need to be cached as uncompressed files on disk. */

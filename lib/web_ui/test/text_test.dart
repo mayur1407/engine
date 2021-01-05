@@ -5,6 +5,7 @@
 // @dart = 2.6
 import 'dart:html';
 
+import 'package:test/bootstrap/browser.dart';
 import 'package:test/test.dart';
 
 import 'package:ui/ui.dart';
@@ -12,7 +13,11 @@ import 'package:ui/src/engine.dart';
 
 import 'matchers.dart';
 
-void main() async {
+void main() {
+  internalBootstrapBrowserTest(() => testMain);
+}
+
+void testMain() async {
   const double baselineRatio = 1.1662499904632568;
 
   await webOnlyInitializeTestDomRenderer();
@@ -91,7 +96,7 @@ void main() async {
       fontSize: 14.0,
     ));
     builder.addText('How do you do this fine morning?');
-    final EngineParagraph paragraph = builder.build();
+    final DomParagraph paragraph = builder.build();
 
     expect(paragraph.paragraphElement.parent, isNull);
     expect(paragraph.height, 0.0);
@@ -157,7 +162,7 @@ void main() async {
       fontSize: 15.0,
     ));
     builder.addText('hi');
-    EngineParagraph paragraph = builder.build();
+    DomParagraph paragraph = builder.build();
     expect(paragraph.plainText, isNotNull);
     expect(paragraph.geometricStyle.fontWeight, FontWeight.normal);
 
@@ -184,7 +189,7 @@ void main() async {
     builder.addText('h');
     builder.pushStyle(TextStyle(fontWeight: FontWeight.bold));
     builder.addText('i');
-    final EngineParagraph paragraph = builder.build();
+    final DomParagraph paragraph = builder.build();
     expect(paragraph.plainText, isNull);
     expect(paragraph.geometricStyle.fontWeight, FontWeight.normal);
   });
@@ -197,7 +202,7 @@ void main() async {
       fontSize: 15.0,
     ));
     builder.pushStyle(TextStyle(fontWeight: FontWeight.bold));
-    final EngineParagraph paragraph = builder.build();
+    final DomParagraph paragraph = builder.build();
     expect(paragraph.plainText, '');
     expect(paragraph.geometricStyle.fontWeight, FontWeight.bold);
   });
@@ -218,7 +223,7 @@ void main() async {
     builder.addText(secondSpanText);
     builder.pushStyle(TextStyle(fontStyle: FontStyle.italic));
     builder.addText('followed by a link');
-    final EngineParagraph paragraph = builder.build();
+    final DomParagraph paragraph = builder.build();
     paragraph.layout(const ParagraphConstraints(width: 800.0));
     expect(paragraph.plainText, isNull);
     const int secondSpanStartPosition = firstSpanText.length;
@@ -366,7 +371,7 @@ void main() async {
     builder.pushStyle(TextStyle(fontSize: 30.0, fontWeight: FontWeight.normal));
     const String secondSpanText = 'def';
     builder.addText(secondSpanText);
-    final EngineParagraph paragraph = builder.build();
+    final DomParagraph paragraph = builder.build();
     paragraph.layout(const ParagraphConstraints(width: 800.0));
     expect(paragraph.plainText, isNull);
     final List<SpanElement> spans =
@@ -391,7 +396,7 @@ void main() async {
 
     builder.addText('Hello');
 
-    final EngineParagraph paragraph = builder.build();
+    final DomParagraph paragraph = builder.build();
     expect(paragraph.paragraphElement.style.fontFamily,
         'SomeFont, $fallback, sans-serif');
 
@@ -413,7 +418,7 @@ void main() async {
 
     builder.addText('Hello');
 
-    final EngineParagraph paragraph = builder.build();
+    final DomParagraph paragraph = builder.build();
     expect(paragraph.paragraphElement.style.fontFamily, 'serif');
 
     debugEmulateFlutterTesterEnvironment = true;
@@ -430,7 +435,7 @@ void main() async {
 
     builder.addText('Hello');
 
-    final EngineParagraph paragraph = builder.build();
+    final DomParagraph paragraph = builder.build();
     expect(paragraph.paragraphElement.style.fontFamily,
         '"MyFont 2000", $fallback, sans-serif');
 

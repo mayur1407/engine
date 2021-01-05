@@ -29,9 +29,9 @@ Animator::Animator(Delegate& delegate,
       last_vsync_start_time_(),
       last_frame_target_time_(),
       dart_frame_deadline_(0),
-#if FLUTTER_SHELL_ENABLE_METAL
+#if SHELL_ENABLE_METAL
       layer_tree_pipeline_(fml::MakeRefCounted<LayerTreePipeline>(2)),
-#else   // FLUTTER_SHELL_ENABLE_METAL
+#else   // SHELL_ENABLE_METAL
       // TODO(dnfield): We should remove this logic and set the pipeline depth
       // back to 2 in this case. See
       // https://github.com/flutter/engine/pull/9132 for discussion.
@@ -40,7 +40,7 @@ Animator::Animator(Delegate& delegate,
                   task_runners.GetRasterTaskRunner()
               ? 1
               : 2)),
-#endif  // FLUTTER_SHELL_ENABLE_METAL
+#endif  // SHELL_ENABLE_METAL
       pending_frame_semaphore_(1),
       frame_number_(1),
       paused_(false),
@@ -52,10 +52,6 @@ Animator::Animator(Delegate& delegate,
 }
 
 Animator::~Animator() = default;
-
-float Animator::GetDisplayRefreshRate() const {
-  return waiter_->GetDisplayRefreshRate();
-}
 
 void Animator::Stop() {
   paused_ = true;
@@ -158,7 +154,7 @@ void Animator::BeginFrame(fml::TimePoint vsync_start_time,
     task_runners_.GetUITaskRunner()->PostDelayedTask(
         [self = weak_factory_.GetWeakPtr(),
          notify_idle_task_id = notify_idle_task_id_]() {
-          if (!self.get()) {
+          if (!self) {
             return;
           }
           // If our (this task's) task id is the same as the current one
@@ -228,7 +224,7 @@ void Animator::RequestFrame(bool regenerate_layer_tree) {
 
   task_runners_.GetUITaskRunner()->PostTask([self = weak_factory_.GetWeakPtr(),
                                              frame_number = frame_number_]() {
-    if (!self.get()) {
+    if (!self) {
       return;
     }
     TRACE_EVENT_ASYNC_BEGIN0("flutter", "Frame Request Pending", frame_number);
